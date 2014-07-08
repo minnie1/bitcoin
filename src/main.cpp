@@ -48,6 +48,7 @@ bool fReindex = false;
 bool fTxIndex = false;
 bool fIsBareMultisigStd = true;
 unsigned int nCoinCacheSize = 5000;
+bool fPruned = false;
 
 /** Fees smaller than this (in satoshi) are considered zero fee (for relaying and mining) */
 CFeeRate minRelayTxFee = CFeeRate(1000);
@@ -2986,9 +2987,12 @@ bool static LoadBlockIndexDB()
 bool CheckBlockFiles()
 {
     // Check presence of essential data
-    LogPrintf("Checking required data for active chain is available...\n");
+    int nKeepBlksFromHeight = fPruned ? (max((int)(chainActive.Height() - MIN_BLOCKS_TO_KEEP), 0)) : 0;
+    LogPrintf("Checking required data for active chain is available up to height %i...\n", nKeepBlksFromHeight);
     set<int> setBlkDataFileReadable,setBlkUndoFileReadable;
     for(CBlockIndex* pindex = chainActive.Tip() ; pindex && pindex->pprev ; pindex = pindex->pprev) {
+        if(pindex->nHeight < nKeepBlksFromHeight)
+            break;
         CDiskBlockPos pos(pindex->nFile, 0);
         if (pindex->nStatus & BLOCK_HAVE_DATA)
         {
@@ -3452,29 +3456,41 @@ void static ProcessGetData(CNode* pfrom)
                     // Send block from disk
                     CBlock block;
                     if (!ReadBlockFromDisk(block, (*mi).second))
-                        assert(!"cannot load block from disk");
-                    if (inv.type == MSG_BLOCK)
-                        pfrom->PushMessage("block", block);
-                    else // MSG_FILTERED_BLOCK)
                     {
-                        LOCK(pfrom->cs_filter);
-                        if (pfrom->pfilter)
+                        if (fPruned)
                         {
-                            CMerkleBlock merkleBlock(block, *pfrom->pfilter);
-                            pfrom->PushMessage("merkleblock", merkleBlock);
-                            // CMerkleBlock just contains hashes, so also push any transactions in the block the client did not see
-                            // This avoids hurting performance by pointlessly requiring a round-trip
-                            // Note that there is currently no way for a node to request any single transactions we didnt send here -
-                            // they must either disconnect and retry or request the full block.
-                            // Thus, the protocol spec specified allows for us to provide duplicate txn here,
-                            // however we MUST always provide at least what the remote peer needs
-                            typedef std::pair<unsigned int, uint256> PairType;
-                            BOOST_FOREACH(PairType& pair, merkleBlock.vMatchedTxn)
-                                if (!pfrom->setInventoryKnown.count(CInv(MSG_TX, pair.second)))
-                                    pfrom->PushMessage("tx", block.vtx[pair.first]);
+                            // Ignore requests which ask us for blocks we don't have any more
+                            // Peers shouldn't ask, anyway, as we unset NODE_NETWORK on this mode.
+                            LogPrintf("cannot load block from disk, ignoring request from peer=%d\n", pfrom->id);
+			}
+                        else
+                            AbortNode("cannot load block from disk");
+                    }
+                    else
+                    {
+                        if (inv.type == MSG_BLOCK)
+                            pfrom->PushMessage("block", block);
+                        else // MSG_FILTERED_BLOCK
+                        {
+                            LOCK(pfrom->cs_filter);
+                            if (pfrom->pfilter)
+                            {
+                                CMerkleBlock merkleBlock(block, *pfrom->pfilter);
+                                pfrom->PushMessage("merkleblock", merkleBlock);
+                                // CMerkleBlock just contains hashes, so also push any transactions in the block the client did not see
+                                // This avoids hurting performance by pointlessly requiring a round-trip
+                                // Note that there is currently no way for a node to request any single transactions we didnt send here -
+                                // they must either disconnect and retry or request the full block.
+                                // Thus, the protocol spec specified allows for us to provide duplicate txn here,
+                                // however we MUST always provide at least what the remote peer needs
+                                typedef std::pair<unsigned int, uint256> PairType;
+                                BOOST_FOREACH(PairType& pair, merkleBlock.vMatchedTxn)
+                                    if (!pfrom->setInventoryKnown.count(CInv(MSG_TX, pair.second)))
+                                        pfrom->PushMessage("tx", block.vtx[pair.first]);
+                            }
+                            // else
+                                // no response
                         }
-                        // else
-                            // no response
                     }
 
                     // Trigger them to send a getblocks request for the next batch of inventory
