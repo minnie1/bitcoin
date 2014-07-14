@@ -51,6 +51,9 @@ static const bool DEFAULT_UPNP = USE_UPNP;
 static const bool DEFAULT_UPNP = false;
 #endif
 
+/* semaphore for notifying when new protocol messages can be sent/received */
+extern CTimeoutCondition condMessageHandler;
+
 inline unsigned int ReceiveFloodSize() { return 1000*GetArg("-maxreceivebuffer", 5*1000); }
 inline unsigned int SendBufferSize() { return 1000*GetArg("-maxsendbuffer", 1*1000); }
 
@@ -430,8 +433,10 @@ public:
         // Known checking here is only to save space from duplicates.
         // SendMessages will filter it again for knowns that were added
         // after addresses were pushed.
-        if (addr.IsValid() && !setAddrKnown.count(addr))
+        if (addr.IsValid() && !setAddrKnown.count(addr)) {
             vAddrToSend.push_back(addr);
+            condMessageHandler.notify_one();
+        }
     }
 
 
@@ -447,8 +452,10 @@ public:
     {
         {
             LOCK(cs_inventory);
-            if (!setInventoryKnown.count(inv))
+            if (!setInventoryKnown.count(inv)) {
                 vInventoryToSend.push_back(inv);
+                condMessageHandler.notify_one();
+            }
         }
     }
 
@@ -478,6 +485,7 @@ public:
         else
             mapAlreadyAskedFor.insert(std::make_pair(inv, nRequestTime));
         mapAskFor.insert(std::make_pair(nRequestTime, inv));
+        condMessageHandler.notify_one();
     }
 
 
@@ -541,6 +549,9 @@ public:
             SocketSendData(this);
 
         LEAVE_CRITICAL_SECTION(cs_vSend);
+
+        // wake up ThreadMessageHandler
+        condMessageHandler.notify_one();
     }
 
     void PushVersion();
