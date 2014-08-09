@@ -289,6 +289,7 @@ void MarkBlockAsReceived(const uint256 &hash, NodeId nodeFrom = -1) {
         CNodeState *state = State(itInFlight->second.first);
         state->vBlocksInFlight.erase(itInFlight->second.second);
         state->nBlocksInFlight--;
+        condMessageHandler.notify_one();
         if (itInFlight->second.first == nodeFrom)
             state->nLastBlockReceive = GetTimeMicros();
         mapBlocksInFlight.erase(itInFlight);
@@ -1382,6 +1383,7 @@ void Misbehaving(NodeId pnode, int howmuch)
     {
         LogPrintf("Misbehaving: %s (%d -> %d) BAN THRESHOLD EXCEEDED\n", state->name, state->nMisbehavior-howmuch, state->nMisbehavior);
         state->fShouldBan = true;
+        condMessageHandler.notify_one();
     } else
         LogPrintf("Misbehaving: %s (%d -> %d)\n", state->name, state->nMisbehavior-howmuch, state->nMisbehavior);
 }
@@ -1412,6 +1414,7 @@ void static InvalidBlockFound(CBlockIndex *pindex, const CValidationState &state
             State(it->second)->rejects.push_back(reject);
             if (nDoS > 0)
                 Misbehaving(it->second, nDoS);
+            condMessageHandler.notify_one();
         }
     }
     if (!state.CorruptionPossible()) {
@@ -4433,6 +4436,7 @@ bool ProcessMessages(CNode* pfrom)
 }
 
 
+// Perform SendMessages tasks that require cs_main, such as addr and getdata messages.
 bool SendMessages(CNode* pto, bool fSendTrickle)
 {
     {
@@ -4440,38 +4444,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         if (pto->nVersion == 0)
             return true;
 
-        //
-        // Message: ping
-        //
-        bool pingSend = false;
-        if (pto->fPingQueued) {
-            // RPC ping request by user
-            pingSend = true;
-        }
-        if (pto->nPingNonceSent == 0 && pto->nPingUsecStart + PING_INTERVAL * 1000000 < GetTimeMicros()) {
-            // Ping automatically sent as a latency probe & keepalive.
-            pingSend = true;
-        }
-        if (pingSend) {
-            uint64_t nonce = 0;
-            while (nonce == 0) {
-                GetRandBytes((unsigned char*)&nonce, sizeof(nonce));
-            }
-            pto->fPingQueued = false;
-            pto->nPingUsecStart = GetTimeMicros();
-            if (pto->nVersion > BIP0031_VERSION) {
-                pto->nPingNonceSent = nonce;
-                pto->PushMessage("ping", nonce);
-            } else {
-                // Peer is too old to support ping command with nonce, pong will never arrive.
-                pto->nPingNonceSent = 0;
-                pto->PushMessage("ping");
-            }
-        }
-
-        TRY_LOCK(cs_main, lockMain); // Acquire cs_main for IsInitialBlockDownload() and CNodeState()
-        if (!lockMain)
-            return true;
+        LOCK2(cs_main, pto->cs_vSend); // cs_main required for IsInitialBlockDownload() and CNodeState()
 
         // Address refresh broadcast
         static int64_t nLastRebroadcast;
@@ -4604,7 +4577,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         if (!vInv.empty())
             pto->PushMessage("inv", vInv);
 
-
+/*
         // Detect stalled peers.
         int64_t tNow = GetTimeMillis();
         int nSyncTimeout = GetArg("-synctimeout", 60);
@@ -4631,6 +4604,17 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     pto->id, nSyncTimeout);
                 pto->fDisconnect = true;
             }
+*/
+        // Detect stalled peers. Require that blocks are in flight, we haven't
+        // received a (requested) block in one minute, and that all blocks are
+        // in flight for over two minutes, since we first had a chance to
+        // process an incoming block.
+        int64_t nNow = GetTimeMicros();
+        if (!pto->fDisconnect && state.nBlocksInFlight &&
+            state.nLastBlockReceive < state.nLastBlockProcess - BLOCK_DOWNLOAD_TIMEOUT*1000000 &&
+            state.vBlocksInFlight.front().nTime < state.nLastBlockProcess - 2*BLOCK_DOWNLOAD_TIMEOUT*1000000) {
+            LogPrintf("Peer %s is stalling block download, disconnecting\n", state.name.c_str());
+            pto->fDisconnect = true;
         }
 
         // Update knowledge of peer's block availability.
