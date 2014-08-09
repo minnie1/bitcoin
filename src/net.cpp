@@ -1533,8 +1533,9 @@ void static StartSync(const vector<CNode*> &vNodes) {
     }
     // if a new sync candidate was found, start sync!
     if (pnodeNewSync) {
-        pnodeNewSync->fStartSync = true;
         pnodeSync = pnodeNewSync;
+        pnodeSync->fStartSync = true;
+        LogPrint("net", "Setting peer=%d as syncnode.\n", pnodeSync->id);
     }
 }
 
@@ -1551,7 +1552,7 @@ void ThreadMessageHandler()
             vNodesCopy = vNodes;
             BOOST_FOREACH(CNode* pnode, vNodesCopy) {
                 pnode->AddRef();
-                if (pnode == pnodeSync)
+                if (pnode == pnodeSync && (pnode->fStartSync || pnode->tGetblocks))
                     fHaveSyncNode = true;
             }
         }
